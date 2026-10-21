@@ -1,0 +1,26 @@
+--- a/net/mac80211/rc80211_minstrel_ht_debugfs.c
++++ b/net/mac80211/rc80211_minstrel_ht_debugfs.c
+@@ -79,7 +79,10 @@ minstrel_ht_stats_dump(struct minstrel_h
+ 			p += sprintf(p, "%cGI  ", gimode);
+ 			p += sprintf(p, "%d  ", mg->streams);
+ 		} else if (gflags & IEEE80211_TX_RC_VHT_MCS) {
+-			p += sprintf(p, "VHT%c0 ", htmode);
++			if (gflags & IEEE80211_TX_RC_160_MHZ_WIDTH)
++				p += sprintf(p, "VHT160 ");
++			else
++				p += sprintf(p, "VHT%c0 ", htmode);
+ 			p += sprintf(p, "%cGI ", gimode);
+ 			p += sprintf(p, "%d  ", mg->streams);
+ 		} else if (i == MINSTREL_OFDM_GROUP) {
+@@ -224,7 +227,10 @@ minstrel_ht_stats_csv_dump(struct minstr
+ 			p += sprintf(p, "%cGI,", gimode);
+ 			p += sprintf(p, "%d,", mg->streams);
+ 		} else if (gflags & IEEE80211_TX_RC_VHT_MCS) {
+-			p += sprintf(p, "VHT%c0,", htmode);
++			if (gflags & IEEE80211_TX_RC_160_MHZ_WIDTH)
++				p += sprintf(p, "VHT160 ");
++			else
++				p += sprintf(p, "VHT%c0 ", htmode);
+ 			p += sprintf(p, "%cGI,", gimode);
+ 			p += sprintf(p, "%d,", mg->streams);
+ 		} else if (i == MINSTREL_OFDM_GROUP) {
