@@ -1,0 +1,60 @@
+--- a/net/mac80211/rc80211_minstrel_ht_debugfs.c
++++ b/net/mac80211/rc80211_minstrel_ht_debugfs.c
+@@ -11,6 +11,12 @@
+ #include <net/mac80211.h>
+ #include "rc80211_minstrel_ht.h"
+ 
++/*
++ * Worst case is every group supported: ~440 rows (HT + VHT up to 160 MHz)
++ * at up to ~130 bytes each, so the old 32 KB buffer is too small.
++ */
++#define MINSTREL_STATS_BUF_SIZE	(64 * 1024)
++
+ struct minstrel_debugfs_info {
+ 	size_t len;
+ 	char buf[];
+@@ -28,7 +34,7 @@
+ static int
+ minstrel_stats_release(struct inode *inode, struct file *file)
+ {
+-	kfree(file->private_data);
++	kvfree(file->private_data);
+ 	return 0;
+ }
+ 
+@@ -149,7 +155,7 @@
+ 	unsigned int i;
+ 	char *p;
+ 
+-	ms = kmalloc(32768, GFP_KERNEL);
++	ms = kvmalloc(MINSTREL_STATS_BUF_SIZE, GFP_KERNEL);
+ 	if (!ms)
+ 		return -ENOMEM;
+ 
+@@ -177,7 +183,7 @@
+ 			MINSTREL_TRUNC(mi->avg_ampdu_len),
+ 			MINSTREL_TRUNC(mi->avg_ampdu_len * 10) % 10);
+ 	ms->len = p - ms->buf;
+-	WARN_ON(ms->len + sizeof(*ms) > 32768);
++	WARN_ON(ms->len + sizeof(*ms) > MINSTREL_STATS_BUF_SIZE);
+ 
+ 	return nonseekable_open(inode, file);
+ }
+@@ -297,7 +303,7 @@
+ 	unsigned int i;
+ 	char *p;
+ 
+-	ms = kmalloc(32768, GFP_KERNEL);
++	ms = kvmalloc(MINSTREL_STATS_BUF_SIZE, GFP_KERNEL);
+ 	if (!ms)
+ 		return -ENOMEM;
+ 
+@@ -312,7 +318,7 @@
+ 		p = minstrel_ht_stats_csv_dump(mi, i, p);
+ 
+ 	ms->len = p - ms->buf;
+-	WARN_ON(ms->len + sizeof(*ms) > 32768);
++	WARN_ON(ms->len + sizeof(*ms) > MINSTREL_STATS_BUF_SIZE);
+ 
+ 	return nonseekable_open(inode, file);
+ }
