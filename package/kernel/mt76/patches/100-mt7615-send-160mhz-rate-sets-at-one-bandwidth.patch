@@ -1,0 +1,214 @@
+wifi: mt76: mt7615: send rate sets with a 160 MHz rate at one valid bandwidth
+
+The hardware sends all rates of a station's rate set, and a probe rate, at
+one bandwidth, and mt7615 takes it from the last entry of the set. That is
+harmless while the rates stay at 80 MHz or below, but not once 160 MHz
+rates are in use:
+
+ - a 160 MHz rate (or probe) goes out at 80 MHz when the last entry is an
+   80 MHz rate, so statistics of 80 MHz transmissions are credited to a
+   160 MHz rate;
+ - rates that the hardware cannot send at 160 MHz (3 and 4 streams) go out
+   at 160 MHz when the last entry is a 160 MHz rate. Those frames are lost
+   without a tx status, so rate control never learns that they fail.
+
+tx status also took the bandwidth from the requested rate, not the one used.
+
+If a set contains a 160 MHz rate, use the bandwidth of its reference rate
+(the probe rate while probing, otherwise the first rate, which is also what
+decides the guard interval) for the whole set and make every VHT rate in it
+valid there: at most two streams at 160 MHz, and the next lower MCS where an
+MCS does not exist at that bandwidth. Duplicate removal no longer steps
+such a rate below MCS 0, which turned a 2 stream MCS 0 into a 1 stream
+MCS 15, or onto an MCS that does not exist. The stored set is changed in the
+same way, so tx status reports what was sent. Sets without a 160 MHz rate
+are handled as before.
+
+Also declare the limit of two streams at 160 MHz to rate control, so that it
+does not select such rates in the first place.
+
+--- a/mt7615/init.c
++++ b/mt7615/init.c
+@@ -365,6 +365,7 @@
+ 	hw->max_rates = 3;
+ 	hw->max_report_rates = 7;
+ 	hw->max_rate_tries = 11;
++	hw->vht160_max_nss = MT7615_MAX_NSS_160;
+ 	hw->netdev_features = NETIF_F_RXCSUM;
+ 
+ 	hw->radiotap_timestamp.units_pos =
+--- a/mt7615/mac.c
++++ b/mt7615/mac.c
+@@ -954,6 +954,88 @@
+ }
+ EXPORT_SYMBOL_GPL(mt7615_mac_sta_poll);
+ 
++#define MT7615_TX_RC_BW_MASK	(IEEE80211_TX_RC_40_MHZ_WIDTH |	\
++				 IEEE80211_TX_RC_80_MHZ_WIDTH |	\
++				 IEEE80211_TX_RC_160_MHZ_WIDTH)
++
++/* bandwidth value of a rate set, see mt7615_mac_tx_rate_val() */
++static u8 mt7615_mac_rate_bw(u32 bw_flags)
++{
++	if (bw_flags & IEEE80211_TX_RC_160_MHZ_WIDTH)
++		return 3;
++	if (bw_flags & IEEE80211_TX_RC_80_MHZ_WIDTH)
++		return 2;
++	if (bw_flags & IEEE80211_TX_RC_40_MHZ_WIDTH)
++		return 1;
++
++	return 0;
++}
++
++/* some VHT MCS do not exist for every bandwidth and number of streams */
++static bool mt7615_vht_mcs_valid(u32 bw_flags, int nss, int mcs)
++{
++	if (mcs == 9) {
++		if (bw_flags & IEEE80211_TX_RC_160_MHZ_WIDTH)
++			return nss != 3;
++		if (bw_flags & IEEE80211_TX_RC_80_MHZ_WIDTH)
++			return nss != 6;
++		if (!(bw_flags & IEEE80211_TX_RC_40_MHZ_WIDTH))
++			return nss == 3 || nss == 6;
++	} else if (mcs == 6 && (bw_flags & IEEE80211_TX_RC_80_MHZ_WIDTH)) {
++		return nss != 3 && nss != 7;
++	}
++
++	return true;
++}
++
++/* make a VHT rate valid at the bandwidth its whole rate set is sent at */
++static void
++mt7615_mac_rate_set_bw(struct ieee80211_tx_rate *rate, u32 bw_flags)
++{
++	int nss, mcs;
++
++	if (!(rate->flags & IEEE80211_TX_RC_VHT_MCS))
++		return;
++
++	rate->flags = (rate->flags & ~MT7615_TX_RC_BW_MASK) | bw_flags;
++
++	nss = ieee80211_rate_get_vht_nss(rate);
++	mcs = ieee80211_rate_get_vht_mcs(rate);
++
++	if ((bw_flags & IEEE80211_TX_RC_160_MHZ_WIDTH) &&
++	    nss > MT7615_MAX_NSS_160)
++		nss = MT7615_MAX_NSS_160;
++
++	while (mcs && !mt7615_vht_mcs_valid(bw_flags, nss, mcs))
++		mcs--;
++
++	ieee80211_rate_set_vht(rate, mcs, nss);
++}
++
++/* step a rate down to the next lower MCS that exists, MCS 0 stays */
++static void
++mt7615_mac_rate_dec_mcs(struct ieee80211_tx_rate *rate, u32 bw_flags)
++{
++	int nss, mcs;
++
++	if (!(rate->flags & IEEE80211_TX_RC_VHT_MCS)) {
++		if (rate->idx)
++			rate->idx--;
++		return;
++	}
++
++	nss = ieee80211_rate_get_vht_nss(rate);
++	mcs = ieee80211_rate_get_vht_mcs(rate);
++	if (!mcs)
++		return;
++
++	mcs--;
++	while (mcs && !mt7615_vht_mcs_valid(bw_flags, nss, mcs))
++		mcs--;
++
++	ieee80211_rate_set_vht(rate, mcs, nss);
++}
++
+ static void
+ mt7615_mac_update_rate_desc(struct mt7615_phy *phy, struct mt7615_sta *sta,
+ 			    struct ieee80211_tx_rate *probe_rate,
+@@ -963,9 +1045,10 @@
+ 	struct mt7615_dev *dev = phy->dev;
+ 	struct mt76_phy *mphy = phy->mt76;
+ 	struct ieee80211_tx_rate *ref;
+-	bool rateset, stbc = false;
++	bool rateset, stbc = false, same_bw = false;
+ 	int n_rates = sta->n_rates;
+ 	u8 bw, bw_prev;
++	u32 bw_flags;
+ 	int i, j;
+ 
+ 	for (i = n_rates; i < 4; i++)
+@@ -983,7 +1066,31 @@
+ 	}
+ 
+ 	rates = sta->rateset[rateset].rates;
++
++	/*
++	 * The hardware sends all rates of a set at one bandwidth. Normally
++	 * that is the one of the last rate, which can put a 160 MHz rate on
++	 * the air at 80 MHz, or a rate that only exists at 80 MHz or less on
++	 * the air at 160 MHz where it is lost without any tx status.
++	 * If the set has a 160 MHz rate, use the bandwidth of the reference
++	 * rate (the probe rate or the first rate) for all of it and make every
++	 * VHT rate valid there. As the stored set is changed as well, tx status
++	 * reports the bandwidth that was used.
++	 */
++	bw_flags = ref->flags & MT7615_TX_RC_BW_MASK;
++	if (probe_rate && (ref->flags & IEEE80211_TX_RC_160_MHZ_WIDTH))
++		same_bw = true;
++	for (i = 0; i < ARRAY_SIZE(sta->rateset[rateset].rates); i++)
++		if (rates[i].flags & IEEE80211_TX_RC_160_MHZ_WIDTH)
++			same_bw = true;
++
++	if (same_bw && probe_rate)
++		mt7615_mac_rate_set_bw(ref, bw_flags);
++
+ 	for (i = 0; i < ARRAY_SIZE(sta->rateset[rateset].rates); i++) {
++		if (same_bw)
++			mt7615_mac_rate_set_bw(&rates[i], bw_flags);
++
+ 		/*
+ 		 * We don't support switching between short and long GI
+ 		 * within the rate set. For accurate tx status reporting, we
+@@ -1003,6 +1110,11 @@
+ 			     IEEE80211_TX_RC_160_MHZ_WIDTH))
+ 				continue;
+ 
++			if (same_bw) {
++				mt7615_mac_rate_dec_mcs(&rates[i], bw_flags);
++				continue;
++			}
++
+ 			if (!rates[i].idx)
+ 				continue;
+ 
+@@ -1014,7 +1126,7 @@
+ 	bw_prev = bw;
+ 
+ 	if (probe_rate) {
+-		rd->probe_val = mt7615_mac_tx_rate_val(dev, mphy, probe_rate,
++		rd->probe_val = mt7615_mac_tx_rate_val(dev, mphy, ref,
+ 						       stbc, &bw);
+ 		if (bw)
+ 			rd->bw_idx = 1;
+@@ -1041,7 +1153,7 @@
+ 		rd->bw_idx = 7;
+ 
+ 	rd->rateset = rateset;
+-	rd->bw = bw;
++	rd->bw = same_bw ? mt7615_mac_rate_bw(bw_flags) : bw;
+ }
+ 
+ static int
+--- a/mt7615/mt7615.h
++++ b/mt7615/mt7615.h
+@@ -23,6 +23,7 @@
+ #define MT7615_HW_SCAN_TIMEOUT		(HZ / 10)
+ #define MT7615_RESET_TIMEOUT		(30 * HZ)
+ #define MT7615_RATE_RETRY		2
++#define MT7615_MAX_NSS_160		2
+ 
+ #define MT7615_TX_RING_SIZE		1024
+ #define MT7615_TX_MGMT_RING_SIZE	128

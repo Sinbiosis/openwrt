@@ -18,9 +18,9 @@
  		} else if (gflags & IEEE80211_TX_RC_VHT_MCS) {
 -			p += sprintf(p, "VHT%c0,", htmode);
 +			if (gflags & IEEE80211_TX_RC_160_MHZ_WIDTH)
-+				p += sprintf(p, "VHT160 ");
++				p += sprintf(p, "VHT160,");
 +			else
-+				p += sprintf(p, "VHT%c0 ", htmode);
++				p += sprintf(p, "VHT%c0,", htmode);
  			p += sprintf(p, "%cGI,", gimode);
  			p += sprintf(p, "%d,", mg->streams);
  		} else if (i == MINSTREL_OFDM_GROUP) {

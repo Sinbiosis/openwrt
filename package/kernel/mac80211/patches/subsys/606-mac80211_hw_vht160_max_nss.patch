@@ -1,0 +1,91 @@
+mac80211: let the driver declare how many streams it can use at 160 MHz
+
+Which spatial streams a chip can send at 160 MHz is a property of the
+hardware, not something every system needs to be told through a module
+parameter. Add ieee80211_hw.vht160_max_nss for the driver to set and make
+minstrel_ht leave out 160 MHz rates that need more streams than that.
+
+minstrel_vht160_max_nss stays as an override for testing: -1 (the default)
+follows the driver, 0 turns 160 MHz rates off, and N > 0 uses N instead of
+the driver's limit and also limits every VHT rate of a station operating at
+160 MHz to N streams.
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -3265,6 +3265,11 @@
+  * 	The power level at idx 0 shall be the maximum positive power level.
+  *
+  * @max_txpwr_levels_idx: the maximum valid idx of 'tx_power_levels' list.
++ *
++ * @vht160_max_nss: the maximum number of spatial streams the hardware can
++ *	transmit with at 160 MHz bandwidth, or 0 if there is no such limit.
++ *	Rate control leaves out 160 MHz rates with more streams, even if the
++ *	peer advertises them.
+  */
+ struct ieee80211_hw {
+ 	struct ieee80211_conf conf;
+@@ -3303,6 +3308,7 @@
+ 	u32 max_mtu;
+ 	const s8 *tx_power_levels;
+ 	u8 max_txpwr_levels_idx;
++	u8 vht160_max_nss;
+ };
+ 
+ static inline bool _ieee80211_hw_check(struct ieee80211_hw *hw,
+--- a/net/mac80211/rc80211_minstrel_ht.c
++++ b/net/mac80211/rc80211_minstrel_ht.c
+@@ -202,17 +202,17 @@
+ 		 "Use only VHT rates when VHT is supported by sta.");
+ 
+ /*
+- * Many chips build a 160 MHz channel from two 80 MHz halves and cannot
+- * carry more than two spatial streams on it, even if they advertise more.
+- * Some of them also send a whole rate set (and any probe rate) at the
+- * widest bandwidth in it, so a rate that is fine at 80 MHz can end up on
+- * the air at 160 MHz. For stations operating at 160 MHz the limit is
+- * therefore applied to all bandwidths.
++ * Many chips cannot carry more than two spatial streams at 160 MHz, even
++ * if they advertise more. A driver declares what its hardware can do in
++ * ieee80211_hw.vht160_max_nss; this parameter overrides that while testing:
++ * -1 follows the driver, 0 turns 160 MHz rates off, and N > 0 limits all VHT
++ * rates of a station operating at 160 MHz to N streams, which also keeps
++ * every rate valid on hardware that sends a whole rate set at one bandwidth.
+  */
+-static int minstrel_vht160_max_nss = 2;
++static int minstrel_vht160_max_nss = -1;
+ module_param(minstrel_vht160_max_nss, int, 0644);
+ MODULE_PARM_DESC(minstrel_vht160_max_nss,
+-		 "Maximum number of spatial streams to use with stations operating at 160 MHz (0 disables 160 MHz rates).");
++		 "Override the stream limit at 160 MHz: -1 uses the driver's limit (default), 0 disables 160 MHz rates, N limits VHT rates of stations operating at 160 MHz to N streams.");
+ 
+ /*
+  * To enable sufficiently targeted rate sampling, MCS rates are divided into
+@@ -1697,6 +1697,7 @@
+ 	struct sta_info *sta_info;
+ 	bool ldpc, erp;
+ 	int use_vht;
++	int max_nss_160;
+ 	int ack_dur;
+ 	int stbc;
+ 	int i;
+@@ -1708,6 +1709,11 @@
+ 	else
+ 		use_vht = 0;
+ 
++	/* streams usable at 160 MHz: the driver's limit, unless overridden */
++	max_nss_160 = minstrel_vht160_max_nss;
++	if (max_nss_160 < 0)
++		max_nss_160 = mp->hw->vht160_max_nss ?: INT_MAX;
++
+ 	memset(mi, 0, sizeof(*mi));
+ 
+ 	mi->sta = sta;
+@@ -1803,7 +1809,7 @@
+ 			}
+ 		} else if (gflags & IEEE80211_TX_RC_160_MHZ_WIDTH) {
+ 			if (sta->deflink.bandwidth < IEEE80211_STA_RX_BW_160 ||
+-			    nss > minstrel_vht160_max_nss) {
++			    nss > max_nss_160) {
+ 				continue;
+ 			}
+ 		}

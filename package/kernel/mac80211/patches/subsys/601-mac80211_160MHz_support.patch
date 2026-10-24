@@ -89,7 +89,7 @@
  			mask = BIT(6);
  		else if (nss == 6)
  			mask = BIT(9);
-+	} else if(bw == BW_160) {
++	} else if (bw == BW_160) {
 +		if (nss == 3)
 +			mask = BIT(9);
  	} else {
@@ -105,13 +105,15 @@
  }
  
  /*
-@@ -363,7 +379,8 @@ minstrel_vht_ri_get_group_idx(struct rat
+@@ -362,8 +378,9 @@ minstrel_vht_ri_get_group_idx(struct rat
+ {
  	return VHT_GROUP_IDX(rate->nss,
  			     !!(rate->flags & RATE_INFO_FLAGS_SHORT_GI),
- 			     !!(rate->bw & RATE_INFO_BW_40) +
+-			     !!(rate->bw & RATE_INFO_BW_40) +
 -			     2*!!(rate->bw & RATE_INFO_BW_80));
-+			     2*!!(rate->bw & RATE_INFO_BW_80) +
-+			     3*!!(rate->bw & RATE_INFO_BW_160));
++			     (rate->bw == RATE_INFO_BW_40) +
++			     2 * (rate->bw == RATE_INFO_BW_80) +
++			     3 * (rate->bw == RATE_INFO_BW_160));
  }
  
  static struct minstrel_rate_stats *
