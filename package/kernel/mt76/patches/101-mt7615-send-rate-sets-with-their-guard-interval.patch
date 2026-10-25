@@ -1,0 +1,114 @@
+wifi: mt76: mt7615: send a rate set with the guard interval it asks for
+
+mt7615 takes the guard interval of a rate set from the per-bandwidth
+short GI bits in WTBL DW5, not from the rates: the 12-bit rate values
+have no guard interval field. Those bits are set once, at station add,
+for every bandwidth at which the peer supports short GI, so every frame
+went out with short GI even when rate control chose a long GI rate.
+Tx status still reported the long GI rate, so the long GI statistics
+were really short GI transmissions, and there was no long GI fallback.
+Between two MT7615, the senders reported long GI rates 61 times while
+the receivers logged no long GI frame in 433 samples.
+
+The driver already makes all rates of a set follow the guard interval
+of the reference rate (the probe rate while probing, otherwise the first
+rate). Program the DW5 short GI bits from that rate as well: the peer's
+short GI bandwidths if it uses short GI, none otherwise. Long GI is
+always allowed, and short GI is still only used where the peer supports
+it.
+
+--- a/mt7615/mac.c
++++ b/mt7615/mac.c
+@@ -1036,6 +1036,29 @@ mt7615_mac_rate_dec_mcs(struct ieee80211
+ 	ieee80211_rate_set_vht(rate, mcs, nss);
+ }
+ 
++/* WTBL DW5 short GI bits for the bandwidths the peer supports it at */
++static u32 mt7615_mac_sgi_mask(struct ieee80211_sta *sta)
++{
++	u32 mask = 0;
++
++	if (!sta)
++		return 0;
++
++	if (sta->deflink.ht_cap.cap & IEEE80211_HT_CAP_SGI_20)
++		mask |= MT_WTBL_W5_SHORT_GI_20;
++	if (sta->deflink.ht_cap.cap & IEEE80211_HT_CAP_SGI_40)
++		mask |= MT_WTBL_W5_SHORT_GI_40;
++
++	if (sta->deflink.vht_cap.vht_supported) {
++		if (sta->deflink.vht_cap.cap & IEEE80211_VHT_CAP_SHORT_GI_80)
++			mask |= MT_WTBL_W5_SHORT_GI_80;
++		if (sta->deflink.vht_cap.cap & IEEE80211_VHT_CAP_SHORT_GI_160)
++			mask |= MT_WTBL_W5_SHORT_GI_160;
++	}
++
++	return mask;
++}
++
+ static void
+ mt7615_mac_update_rate_desc(struct mt7615_phy *phy, struct mt7615_sta *sta,
+ 			    struct ieee80211_tx_rate *probe_rate,
+@@ -1154,6 +1177,16 @@ mt7615_mac_update_rate_desc(struct mt761
+ 
+ 	rd->rateset = rateset;
+ 	rd->bw = same_bw ? mt7615_mac_rate_bw(bw_flags) : bw;
++
++	/*
++	 * The rate values carry no guard interval: the hardware uses short GI
++	 * for every bandwidth that has its bit set in WTBL DW5. Set those bits
++	 * from the reference rate, which all rates of the set follow, so that
++	 * a long GI rate is sent with long GI and tx status reports the guard
++	 * interval that was used.
++	 */
++	if (ref->flags & IEEE80211_TX_RC_SHORT_GI)
++		rd->sgi = mt7615_mac_sgi_mask(wcid_to_sta(&sta->wcid));
+ }
+ 
+ static int
+@@ -1231,12 +1264,15 @@ void mt7615_mac_set_rates(struct mt7615_
+ 
+ 	w5 = mt76_rr(dev, addr + 5 * 4);
+ 	w5 &= ~(MT_WTBL_W5_BW_CAP | MT_WTBL_W5_CHANGE_BW_RATE |
++		MT_WTBL_W5_SHORT_GI_20 | MT_WTBL_W5_SHORT_GI_40 |
++		MT_WTBL_W5_SHORT_GI_80 | MT_WTBL_W5_SHORT_GI_160 |
+ 		MT_WTBL_W5_MPDU_OK_COUNT |
+ 		MT_WTBL_W5_MPDU_FAIL_COUNT |
+ 		MT_WTBL_W5_RATE_IDX);
+ 	w5 |= FIELD_PREP(MT_WTBL_W5_BW_CAP, rd.bw) |
+ 	      FIELD_PREP(MT_WTBL_W5_CHANGE_BW_RATE,
+-			 rd.bw_idx ? rd.bw_idx - 1 : 7);
++			 rd.bw_idx ? rd.bw_idx - 1 : 7) |
++	      rd.sgi;
+ 
+ 	mt76_wr(dev, MT_WTBL_RIUCR0, w5);
+ 
+--- a/mt7615/mt7615.h
++++ b/mt7615/mt7615.h
+@@ -100,6 +100,7 @@ struct mt7615_rate_desc {
+ 	u16 val[4];
+ 	u8 bw_idx;
+ 	u8 bw;
++	u32 sgi;
+ };
+ 
+ struct mt7615_wtbl_rate_desc {
+--- a/mt7615/usb_sdio.c
++++ b/mt7615/usb_sdio.c
+@@ -77,12 +77,15 @@ static int mt7663_usb_sdio_set_rates(str
+ 
+ 	w5 = mt76_rr(dev, addr + 5 * 4);
+ 	w5 &= ~(MT_WTBL_W5_BW_CAP | MT_WTBL_W5_CHANGE_BW_RATE |
++		MT_WTBL_W5_SHORT_GI_20 | MT_WTBL_W5_SHORT_GI_40 |
++		MT_WTBL_W5_SHORT_GI_80 | MT_WTBL_W5_SHORT_GI_160 |
+ 		MT_WTBL_W5_MPDU_OK_COUNT |
+ 		MT_WTBL_W5_MPDU_FAIL_COUNT |
+ 		MT_WTBL_W5_RATE_IDX);
+ 	w5 |= FIELD_PREP(MT_WTBL_W5_BW_CAP, rate->bw) |
+ 	      FIELD_PREP(MT_WTBL_W5_CHANGE_BW_RATE,
+-			 rate->bw_idx ? rate->bw_idx - 1 : 7);
++			 rate->bw_idx ? rate->bw_idx - 1 : 7) |
++	      rate->sgi;
+ 
+ 	mt76_wr(dev, MT_WTBL_RIUCR0, w5);
+ 
