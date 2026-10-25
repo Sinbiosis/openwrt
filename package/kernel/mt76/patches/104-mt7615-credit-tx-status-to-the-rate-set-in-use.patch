@@ -1,0 +1,42 @@
+wifi: mt76: mt7615: credit tx status to the rate set that was in use
+
+Tx status picks one of the two rate sets by comparing the time of the
+first transmission with the time of the newest rate set update: a frame
+first sent within one second after the update is credited to the newest
+set, any other frame to the previous one. A frame first sent more than
+a second after the update used the newest set too, so with sparse
+traffic its status went to a rate set that was no longer in use. With
+a frame every 3 seconds, 75-78% of the tx status reports between two
+MT7615 were credited to the previous set.
+
+Credit a frame to the previous set only if it was first sent before the
+newest update.
+
+--- a/mt7615/mac.c
++++ b/mt7615/mac.c
+@@ -1590,6 +1590,7 @@ static bool __mt7615_fill_txs(struct mt7
+ 	bool ampdu, cck = false;
+ 	bool rs_idx;
+ 	u32 rate_set_tsf;
++	s32 age;
+ 	u32 final_rate, final_rate_flags, final_nss, txs;
+ 
+ 	txs = le32_to_cpu(txs_data[1]);
+@@ -1628,10 +1629,14 @@ static bool __mt7615_fill_txs(struct mt7
+ 		goto out;
+ 	}
+ 
++	/*
++	 * A frame first sent before the newest rate set update used the
++	 * previous rate set, one sent after it the newest set, however long
++	 * ago that update was.
++	 */
+ 	rate_set_tsf = READ_ONCE(sta->rate_set_tsf);
+-	rs_idx = !((u32)(le32_get_bits(txs_data[4], MT_TXS4_F0_TIMESTAMP) -
+-			 rate_set_tsf) < 1000000);
+-	rs_idx ^= rate_set_tsf & BIT(0);
++	age = le32_get_bits(txs_data[4], MT_TXS4_F0_TIMESTAMP) - rate_set_tsf;
++	rs_idx = (age < 0) ^ (rate_set_tsf & BIT(0));
+ 	rs = &sta->rateset[rs_idx];
+ 
+ 	mt7615_txs_stats_set(dev, sta, txs_data, rate_set_tsf, rs_idx,

@@ -1,0 +1,59 @@
+wifi: mt76: mt7615: report the bandwidth a rate was sent with
+
+The hardware sends all rates of a rate set at one bandwidth, which is
+not always the bandwidth of each rate in the set. Tx status took the
+bandwidth from the rate set, so rate control was credited with rates at
+bandwidths that were not used: between two MT7615, the tx status gave a
+different bandwidth than the hardware for 11-15% of the frames at one
+frame per second (mostly probes) and about 1% under load.
+
+The tx status has the bandwidth that was used. Report it for the final
+rate, as mt76_connac2_mac_fill_txs() does for the newer chips.
+
+--- a/mt7615/mac.c
++++ b/mt7615/mac.c
+@@ -1550,6 +1550,34 @@ static void mt7615_txs_stats_set(struct
+ 	st->bw[i][le32_get_bits(txs_data[1], MT_TXS1_BW)]++;
+ }
+ 
++/*
++ * The hardware sends all rates of a rate set at one bandwidth, which is
++ * not always the bandwidth of each rate: take the bandwidth of an HT or
++ * VHT rate from the tx status, which has the one that was used.
++ */
++static u32 mt7615_txs_rate_bw(u32 flags, __le32 *txs_data)
++{
++	u32 bw = le32_get_bits(txs_data[1], MT_TXS1_BW);
++
++	if (!(flags & (IEEE80211_TX_RC_MCS | IEEE80211_TX_RC_VHT_MCS)))
++		return flags;
++
++	flags &= ~MT7615_TX_RC_BW_MASK;
++	if (bw && (flags & IEEE80211_TX_RC_MCS))
++		return flags | IEEE80211_TX_RC_40_MHZ_WIDTH;
++
++	switch (bw) {
++	case 1:
++		return flags | IEEE80211_TX_RC_40_MHZ_WIDTH;
++	case 2:
++		return flags | IEEE80211_TX_RC_80_MHZ_WIDTH;
++	case 3:
++		return flags | IEEE80211_TX_RC_160_MHZ_WIDTH;
++	default:
++		return flags;
++	}
++}
++
+ static bool __mt7615_fill_txs(struct mt7615_dev *dev, struct mt7615_sta *sta,
+ 			      struct ieee80211_tx_info *info, __le32 *txs_data)
+ {
+@@ -1692,7 +1720,8 @@ out:
+ 	}
+ 
+ 	info->status.rates[i].idx = final_rate;
+-	info->status.rates[i].flags = final_rate_flags;
++	info->status.rates[i].flags = mt7615_txs_rate_bw(final_rate_flags,
++							 txs_data);
+ 
+ 	return true;
+ }
