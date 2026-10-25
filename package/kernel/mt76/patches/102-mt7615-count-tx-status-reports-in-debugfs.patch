@@ -1,0 +1,289 @@
+wifi: mt76: mt7615: count tx status reports in debugfs
+
+Add a debugfs file, txs_stats, with counters of the tx status reports,
+to find out how they map to what rate control is told:
+
+- status flags: ACK, RTS and queue timeouts, block ack errors, A-MPDU,
+  fixed rate, no transmission at all, and reports that reach mac80211
+  without rate information
+- the time from the newest rate set update to the first transmission,
+  which decides the rate set a report is credited to
+- whether the final rate at the last slot used is in the chosen rate
+  set, only in the other one, in both or in neither
+- the bandwidth a report gives for the bandwidth of that rate
+- the transmission count and the last rate slot used
+
+Writing to txs_stats_reset clears the counters. This is a measurement
+aid only; nothing else changes.
+
+--- a/mt7615/debugfs.c
++++ b/mt7615/debugfs.c
+@@ -352,6 +352,68 @@ mt7615_radio_read(struct seq_file *s, vo
+ }
+ 
+ static int
++mt7615_txs_stats_read(struct seq_file *s, void *data)
++{
++	struct mt7615_dev *dev = dev_get_drvdata(s->private);
++	struct mt7615_txs_stats *st = &dev->txs_stats;
++	static const char * const age[] = {
++		"<-1s", "-1s..0", "0..1ms", "1..10ms", "10..100ms",
++		"100ms..1s", ">=1s",
++	};
++	static const char * const match[] = {
++		"chosen", "other", "both", "neither",
++	};
++	int i, j;
++
++	seq_printf(s, "total %u fixed_rate %u ampdu %u no_tx %u no_rate_info %u\n",
++		   st->total, st->fixed_rate, st->ampdu, st->no_tx,
++		   st->no_rate_info);
++	seq_printf(s, "ack_timeout %u rts_timeout %u queue_timeout %u ba_error %u\n",
++		   st->ack_timeout, st->rts_timeout, st->queue_timeout,
++		   st->ba_error);
++
++	seq_puts(s, "age:");
++	for (i = 0; i < ARRAY_SIZE(st->age); i++)
++		seq_printf(s, " %s %u", age[i], st->age[i]);
++
++	seq_puts(s, "\nset_match:");
++	for (i = 0; i < ARRAY_SIZE(st->set_match); i++)
++		seq_printf(s, " %s %u", match[i], st->set_match[i]);
++
++	seq_puts(s, "\nbw (rate->txs):");
++	for (i = 0; i < 4; i++)
++		for (j = 0; j < 4; j++)
++			if (st->bw[i][j])
++				seq_printf(s, " %d->%d %u", 20 << i, 20 << j,
++					   st->bw[i][j]);
++
++	seq_puts(s, "\ntx_count:");
++	for (i = 0; i < ARRAY_SIZE(st->tx_count); i++)
++		if (st->tx_count[i])
++			seq_printf(s, " %d:%u", i, st->tx_count[i]);
++
++	seq_puts(s, "\nlast_idx:");
++	for (i = 0; i < ARRAY_SIZE(st->last_idx); i++)
++		seq_printf(s, " %d:%u", i, st->last_idx[i]);
++	seq_puts(s, "\n");
++
++	return 0;
++}
++
++static int
++mt7615_txs_stats_reset(void *data, u64 val)
++{
++	struct mt7615_dev *dev = data;
++
++	memset(&dev->txs_stats, 0, sizeof(dev->txs_stats));
++
++	return 0;
++}
++
++DEFINE_DEBUGFS_ATTRIBUTE(fops_txs_stats_reset, NULL,
++			 mt7615_txs_stats_reset, "%lld\n");
++
++static int
+ mt7615_queues_acq(struct seq_file *s, void *data)
+ {
+ 	struct mt7615_dev *dev = dev_get_drvdata(s->private);
+@@ -570,6 +632,10 @@ int mt7615_init_debugfs(struct mt7615_de
+ 				    mt7615_pm_stats);
+ 	debugfs_create_devm_seqfile(dev->mt76.dev, "radio", dir,
+ 				    mt7615_radio_read);
++	debugfs_create_devm_seqfile(dev->mt76.dev, "txs_stats", dir,
++				    mt7615_txs_stats_read);
++	debugfs_create_file("txs_stats_reset", 0200, dir, dev,
++			    &fops_txs_stats_reset);
+ 
+ 	if (is_mt7615(&dev->mt76)) {
+ 		debugfs_create_u32("dfs_hw_pattern", 0400, dir,
+--- a/mt7615/mac.c
++++ b/mt7615/mac.c
+@@ -1438,8 +1438,120 @@ int mt7615_mac_wtbl_set_key(struct mt761
+ 	return err;
+ }
+ 
+-static bool mt7615_fill_txs(struct mt7615_dev *dev, struct mt7615_sta *sta,
+-			    struct ieee80211_tx_info *info, __le32 *txs_data)
++/* a rate value with the stream count it really has, i.e. without STBC */
++static u16 mt7615_txs_rate_norm(u16 val)
++{
++	u16 nss = FIELD_GET(MT_TX_RATE_NSS, val);
++
++	if ((val & MT_TX_RATE_STBC) && nss)
++		nss--;
++
++	return (val & (MT_TX_RATE_MODE | MT_TX_RATE_IDX)) |
++	       FIELD_PREP(MT_TX_RATE_NSS, nss);
++}
++
++/* rate value that mt7615_mac_set_rates() put into hardware rate slot @slot */
++static u16 mt7615_txs_slot_val(struct mt7615_dev *dev, struct mt76_phy *mphy,
++			       struct mt7615_rate_set *rs, int slot)
++{
++	struct ieee80211_tx_rate *rate = &rs->rates[slot / 2];
++	u8 bw;
++
++	if (!slot && rs->probe_rate.idx >= 0)
++		rate = &rs->probe_rate;
++
++	return mt7615_txs_rate_norm(mt7615_mac_tx_rate_val(dev, mphy, rate,
++							   false, &bw));
++}
++
++static void mt7615_txs_stats_flags(struct mt7615_dev *dev, __le32 *txs_data)
++{
++	struct mt7615_txs_stats *st = &dev->txs_stats;
++	u32 txs0 = le32_to_cpu(txs_data[0]);
++	u32 txs1 = le32_to_cpu(txs_data[1]);
++	u32 txs3 = le32_to_cpu(txs_data[3]);
++	int count = FIELD_GET(MT_TXS3_TX_COUNT, txs3);
++
++	st->total++;
++	st->tx_count[count]++;
++	st->last_idx[FIELD_GET(MT_TXS3_LAST_TX_RATE, txs3)]++;
++	if (!count)
++		st->no_tx++;
++	if (txs0 & MT_TXS0_FIXED_RATE)
++		st->fixed_rate++;
++	if (txs1 & MT_TXS1_AMPDU)
++		st->ampdu++;
++	if (txs0 & MT_TXS0_ACK_TIMEOUT)
++		st->ack_timeout++;
++	if (txs0 & MT_TXS0_RTS_TIMEOUT)
++		st->rts_timeout++;
++	if (txs0 & MT_TXS0_QUEUE_TIMEOUT)
++		st->queue_timeout++;
++	if (txs0 & MT_TXS0_BA_ERROR)
++		st->ba_error++;
++}
++
++/*
++ * How the rate set was chosen for a tx status: the time from the newest
++ * rate set update to the first transmission, which rate set holds the
++ * final rate at the last slot used, and the bandwidth reported in the tx
++ * status for the bandwidth of that rate.
++ */
++static void mt7615_txs_stats_set(struct mt7615_dev *dev,
++				 struct mt7615_sta *sta, __le32 *txs_data,
++				 u32 rate_set_tsf, bool rs_idx, int last_idx,
++				 u32 final_rate)
++{
++	struct mt7615_txs_stats *st = &dev->txs_stats;
++	struct mt76_phy *mphy = &dev->mphy;
++	u16 val = mt7615_txs_rate_norm(final_rate);
++	struct ieee80211_tx_rate *rate;
++	bool chosen, other;
++	s32 age;
++	int i;
++
++	if (sta->wcid.phy_idx && dev->mt76.phys[MT_BAND1])
++		mphy = dev->mt76.phys[MT_BAND1];
++
++	age = le32_get_bits(txs_data[4], MT_TXS4_F0_TIMESTAMP) - rate_set_tsf;
++	if (age < -1000000)
++		i = 0;
++	else if (age < 0)
++		i = 1;
++	else if (age < 1000)
++		i = 2;
++	else if (age < 10000)
++		i = 3;
++	else if (age < 100000)
++		i = 4;
++	else if (age < 1000000)
++		i = 5;
++	else
++		i = 6;
++	st->age[i]++;
++
++	chosen = mt7615_txs_slot_val(dev, mphy, &sta->rateset[rs_idx],
++				     last_idx) == val;
++	other = mt7615_txs_slot_val(dev, mphy, &sta->rateset[!rs_idx],
++				    last_idx) == val;
++	st->set_match[chosen ? (other ? 2 : 0) : (other ? 1 : 3)]++;
++
++	rate = &sta->rateset[rs_idx].rates[last_idx / 2];
++	if (!last_idx && sta->rateset[rs_idx].probe_rate.idx >= 0)
++		rate = &sta->rateset[rs_idx].probe_rate;
++	if (rate->flags & IEEE80211_TX_RC_160_MHZ_WIDTH)
++		i = 3;
++	else if (rate->flags & IEEE80211_TX_RC_80_MHZ_WIDTH)
++		i = 2;
++	else if (rate->flags & IEEE80211_TX_RC_40_MHZ_WIDTH)
++		i = 1;
++	else
++		i = 0;
++	st->bw[i][le32_get_bits(txs_data[1], MT_TXS1_BW)]++;
++}
++
++static bool __mt7615_fill_txs(struct mt7615_dev *dev, struct mt7615_sta *sta,
++			      struct ieee80211_tx_info *info, __le32 *txs_data)
+ {
+ 	struct ieee80211_supported_band *sband;
+ 	struct mt7615_rate_set *rs;
+@@ -1494,6 +1606,9 @@ static bool mt7615_fill_txs(struct mt761
+ 	rs_idx ^= rate_set_tsf & BIT(0);
+ 	rs = &sta->rateset[rs_idx];
+ 
++	mt7615_txs_stats_set(dev, sta, txs_data, rate_set_tsf, rs_idx,
++			     last_idx, final_rate);
++
+ 	if (!first_idx && rs->probe_rate.idx >= 0) {
+ 		info->status.rates[0] = rs->probe_rate;
+ 
+@@ -1582,6 +1697,17 @@ out:
+ 	return true;
+ }
+ 
++static bool mt7615_fill_txs(struct mt7615_dev *dev, struct mt7615_sta *sta,
++			    struct ieee80211_tx_info *info, __le32 *txs_data)
++{
++	mt7615_txs_stats_flags(dev, txs_data);
++	if (__mt7615_fill_txs(dev, sta, info, txs_data))
++		return true;
++
++	dev->txs_stats.no_rate_info++;
++	return false;
++}
++
+ static bool mt7615_mac_add_txs_skb(struct mt7615_dev *dev,
+ 				   struct mt7615_sta *sta, int pid,
+ 				   __le32 *txs_data)
+--- a/mt7615/mt7615.h
++++ b/mt7615/mt7615.h
+@@ -110,6 +110,24 @@ struct mt7615_wtbl_rate_desc {
+ 	struct mt7615_sta *sta;
+ };
+ 
++/* counters of the tx status reports, shown in debugfs (txs_stats) */
++struct mt7615_txs_stats {
++	u32 total;
++	u32 fixed_rate;
++	u32 ampdu;
++	u32 ack_timeout;
++	u32 rts_timeout;
++	u32 queue_timeout;
++	u32 ba_error;
++	u32 no_tx;
++	u32 no_rate_info;
++	u32 age[7];
++	u32 set_match[4];
++	u32 bw[4][4];
++	u32 tx_count[32];
++	u32 last_idx[8];
++};
++
+ struct mt7663s_intr {
+ 	u32 isr;
+ 	struct {
+@@ -280,6 +298,8 @@ struct mt7615_dev {
+ 	struct work_struct rate_work;
+ 	struct list_head wrd_head;
+ 
++	struct mt7615_txs_stats txs_stats;
++
+ 	u32 debugfs_rf_wf;
+ 	u32 debugfs_rf_reg;
+ 
