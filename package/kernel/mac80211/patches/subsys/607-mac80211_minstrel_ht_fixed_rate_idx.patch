@@ -1,0 +1,46 @@
+mac80211: minstrel_ht: use a fixed rate only if the station supports it
+
+The fixed_rate_idx debugfs value was used without any check. A value past
+the last group indexes out of bounds, and a rate the station does not
+support (for example 160 MHz with more streams than the hardware can
+send) was used anyway. Ignore the fixed rate for such stations.
+
+--- a/net/mac80211/rc80211_minstrel_ht.c
++++ b/net/mac80211/rc80211_minstrel_ht.c
+@@ -1066,6 +1066,18 @@ minstrel_ht_refill_sample_rates(struct m
+ 		       sizeof(mi->sample[i].cur_sample_rates));
+ }
+ 
++#ifdef CPTCFG_MAC80211_DEBUGFS
++/* a rate fixed through debugfs is only used if the station supports it */
++static bool
++minstrel_ht_fixed_rate_valid(struct minstrel_priv *mp,
++			     struct minstrel_ht_sta *mi)
++{
++	u32 idx = mp->fixed_rate_idx;
++
++	return idx < MI_RATE(MINSTREL_GROUPS_NB, 0) &&
++	       (mi->supported[MI_RATE_GROUP(idx)] & BIT(MI_RATE_IDX(idx)));
++}
++#endif
+ 
+ /*
+  * Update rate statistics and select new primary rates
+@@ -1200,7 +1212,7 @@ minstrel_ht_update_stats(struct minstrel
+ 
+ #ifdef CPTCFG_MAC80211_DEBUGFS
+ 	/* use fixed index if set */
+-	if (mp->fixed_rate_idx != -1) {
++	if (minstrel_ht_fixed_rate_valid(mp, mi)) {
+ 		for (i = 0; i < 4; i++)
+ 			mi->max_tp_rate[i] = mp->fixed_rate_idx;
+ 		mi->max_prob_rate = mp->fixed_rate_idx;
+@@ -1615,7 +1627,7 @@ minstrel_ht_get_rate(void *priv, struct
+ 	info->flags |= mi->tx_flags;
+ 
+ #ifdef CPTCFG_MAC80211_DEBUGFS
+-	if (mp->fixed_rate_idx != -1)
++	if (minstrel_ht_fixed_rate_valid(mp, mi))
+ 		return;
+ #endif
+ 

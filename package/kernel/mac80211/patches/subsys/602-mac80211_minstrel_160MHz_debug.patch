@@ -1,18 +1,72 @@
+mac80211: minstrel_ht: show the 160 MHz rate groups in debugfs
+
+Label the 160 MHz groups "VHT160" in rc_stats and rc_stats_csv, keeping
+the rc_stats columns aligned.
+
+With the 160 MHz groups, rc_stats no longer fits the 32 KB buffer (up to
+about 54 KB with every group supported), so allocate 64 KB with
+kvmalloc().
+
 --- a/net/mac80211/rc80211_minstrel_ht_debugfs.c
 +++ b/net/mac80211/rc80211_minstrel_ht_debugfs.c
-@@ -79,7 +79,10 @@ minstrel_ht_stats_dump(struct minstrel_h
+@@ -11,6 +11,12 @@
+ #include <net/mac80211.h>
+ #include "rc80211_minstrel_ht.h"
+ 
++/*
++ * Worst case is every group supported: ~440 rows (HT + VHT up to 160 MHz)
++ * at up to ~130 bytes each, so the old 32 KB buffer is too small.
++ */
++#define MINSTREL_STATS_BUF_SIZE	(64 * 1024)
++
+ struct minstrel_debugfs_info {
+ 	size_t len;
+ 	char buf[];
+@@ -28,7 +34,7 @@ minstrel_stats_read(struct file *file, c
+ static int
+ minstrel_stats_release(struct inode *inode, struct file *file)
+ {
+-	kfree(file->private_data);
++	kvfree(file->private_data);
+ 	return 0;
+ }
+ 
+@@ -79,9 +85,13 @@ minstrel_ht_stats_dump(struct minstrel_h
  			p += sprintf(p, "%cGI  ", gimode);
  			p += sprintf(p, "%d  ", mg->streams);
  		} else if (gflags & IEEE80211_TX_RC_VHT_MCS) {
 -			p += sprintf(p, "VHT%c0 ", htmode);
+-			p += sprintf(p, "%cGI ", gimode);
+-			p += sprintf(p, "%d  ", mg->streams);
++			/* "VHT160" is one character longer, take it from the padding */
 +			if (gflags & IEEE80211_TX_RC_160_MHZ_WIDTH)
-+				p += sprintf(p, "VHT160 ");
++				p += sprintf(p, "VHT160 %cGI %d ", gimode,
++					     mg->streams);
 +			else
-+				p += sprintf(p, "VHT%c0 ", htmode);
- 			p += sprintf(p, "%cGI ", gimode);
- 			p += sprintf(p, "%d  ", mg->streams);
++				p += sprintf(p, "VHT%c0 %cGI %d  ", htmode, gimode,
++					     mg->streams);
  		} else if (i == MINSTREL_OFDM_GROUP) {
-@@ -224,7 +227,10 @@ minstrel_ht_stats_csv_dump(struct minstr
+ 			p += sprintf(p, "OFDM       ");
+ 			p += sprintf(p, "1 ");
+@@ -149,7 +159,7 @@ minstrel_ht_stats_open(struct inode *ino
+ 	unsigned int i;
+ 	char *p;
+ 
+-	ms = kmalloc(32768, GFP_KERNEL);
++	ms = kvmalloc(MINSTREL_STATS_BUF_SIZE, GFP_KERNEL);
+ 	if (!ms)
+ 		return -ENOMEM;
+ 
+@@ -177,7 +187,7 @@ minstrel_ht_stats_open(struct inode *ino
+ 			MINSTREL_TRUNC(mi->avg_ampdu_len),
+ 			MINSTREL_TRUNC(mi->avg_ampdu_len * 10) % 10);
+ 	ms->len = p - ms->buf;
+-	WARN_ON(ms->len + sizeof(*ms) > 32768);
++	WARN_ON(ms->len + sizeof(*ms) > MINSTREL_STATS_BUF_SIZE);
+ 
+ 	return nonseekable_open(inode, file);
+ }
+@@ -224,7 +234,10 @@ minstrel_ht_stats_csv_dump(struct minstr
  			p += sprintf(p, "%cGI,", gimode);
  			p += sprintf(p, "%d,", mg->streams);
  		} else if (gflags & IEEE80211_TX_RC_VHT_MCS) {
@@ -24,3 +78,21 @@
  			p += sprintf(p, "%cGI,", gimode);
  			p += sprintf(p, "%d,", mg->streams);
  		} else if (i == MINSTREL_OFDM_GROUP) {
+@@ -297,7 +310,7 @@ minstrel_ht_stats_csv_open(struct inode
+ 	unsigned int i;
+ 	char *p;
+ 
+-	ms = kmalloc(32768, GFP_KERNEL);
++	ms = kvmalloc(MINSTREL_STATS_BUF_SIZE, GFP_KERNEL);
+ 	if (!ms)
+ 		return -ENOMEM;
+ 
+@@ -312,7 +325,7 @@ minstrel_ht_stats_csv_open(struct inode
+ 		p = minstrel_ht_stats_csv_dump(mi, i, p);
+ 
+ 	ms->len = p - ms->buf;
+-	WARN_ON(ms->len + sizeof(*ms) > 32768);
++	WARN_ON(ms->len + sizeof(*ms) > MINSTREL_STATS_BUF_SIZE);
+ 
+ 	return nonseekable_open(inode, file);
+ }

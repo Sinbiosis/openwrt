@@ -1,0 +1,81 @@
+mac80211: minstrel_ht: respect the peer's VHT Rx Highest data rate
+
+A VHT peer can limit the rates it receives with the Rx Highest Supported
+Long GI Data Rate field of its VHT capabilities: a <VHT-MCS, NSS> tuple
+whose long GI data rate is higher is not in its supported set (IEEE
+802.11ac-2013 8.4.2.160.3), and a STA shall not transmit to it with such
+a tuple (9.7.5.6). Some devices use this field to signal fewer streams at
+160 MHz, e.g. QCA9888 (780 Mb/s) and QCA9984 (1560 Mb/s).
+
+Leave such rates out. Single stream MCS 0-7 are mandatory for every VHT
+STA and always kept.
+
+--- a/net/mac80211/rc80211_minstrel_ht.c
++++ b/net/mac80211/rc80211_minstrel_ht.c
+@@ -331,6 +331,37 @@ minstrel_get_valid_vht_rates(int bw, int
+ 	return 0x3ff & ~mask;
+ }
+ 
++/*
++ * A peer can limit the VHT rates it receives with its Rx Highest Supported
++ * Long GI Data Rate: a rate whose long GI data rate (rounded down to Mb/s) is
++ * higher is not supported. Single stream MCS 0-7 are always supported.
++ *
++ * Returns the mcs map of the rates below that limit
++ */
++static u16
++minstrel_get_vht_rx_highest_rates(int bw, int nss, u16 rx_highest)
++{
++	static const u8 rate_bw[] = {
++		[BW_20] = RATE_INFO_BW_20,
++		[BW_40] = RATE_INFO_BW_40,
++		[BW_80] = RATE_INFO_BW_80,
++		[BW_160] = RATE_INFO_BW_160,
++	};
++	struct rate_info ri = {
++		.flags = RATE_INFO_FLAGS_VHT_MCS,
++		.bw = rate_bw[bw],
++		.nss = nss,
++	};
++	u16 mask = 0;
++
++	for (ri.mcs = 0; ri.mcs <= 9; ri.mcs++)
++		if ((nss == 1 && ri.mcs <= 7) ||
++		    cfg80211_calculate_bitrate(&ri) / 10 <= rx_highest)
++			mask |= BIT(ri.mcs);
++
++	return mask;
++}
++
+ static bool
+ minstrel_ht_is_legacy_group(int group)
+ {
+@@ -1683,6 +1714,7 @@ minstrel_ht_update_caps(void *priv, stru
+ 	const struct ieee80211_rate *ctl_rate;
+ 	struct sta_info *sta_info;
+ 	bool ldpc, erp;
++	u16 rx_highest;
+ 	int use_vht;
+ 	int ack_dur;
+ 	int stbc;
+@@ -1695,6 +1727,9 @@ minstrel_ht_update_caps(void *priv, stru
+ 	else
+ 		use_vht = 0;
+ 
++	rx_highest = le16_to_cpu(vht_cap->vht_mcs.rx_highest) &
++		     ~IEEE80211_VHT_MAX_NSTS_TOTAL_MASK;
++
+ 	memset(mi, 0, sizeof(*mi));
+ 
+ 	mi->sta = sta;
+@@ -1811,6 +1846,10 @@ minstrel_ht_update_caps(void *priv, stru
+ 
+ 		mi->supported[i] = minstrel_get_valid_vht_rates(bw, nss,
+ 				vht_cap->vht_mcs.tx_mcs_map);
++		if (rx_highest)
++			mi->supported[i] &=
++				minstrel_get_vht_rx_highest_rates(bw, nss,
++								  rx_highest);
+ 	}
+ 
+ 	sta_info = container_of(sta, struct sta_info, sta);
