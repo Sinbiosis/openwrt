@@ -1,0 +1,106 @@
+wifi: mt76: mt7615: test the bandwidth change slot of 160 MHz sets
+
+Testing aid, not for merging. MediaTek's driver describes the WTBL DW5
+field CHANGE_BW_RATE as "change bw as (fcap/2) if rate_idx > N" and
+always sets N to 7, which turns it off. To check what it does on
+MT7615, add:
+
+- bw160_change_bw_rate in debugfs: overrides CHANGE_BW_RATE (1-7) for
+  rate sets sent at 160 MHz, on MMIO only. 0, the default, leaves it as
+  the driver sets it; a new value takes effect at the next rate set
+  update.
+- a line in txs_stats that counts acknowledged tx status reports by
+  their last slot and the bandwidth they report, so the bandwidth each
+  slot was sent at shows directly.
+
+--- a/mt7615/debugfs.c
++++ b/mt7615/debugfs.c
+@@ -396,6 +396,13 @@ mt7615_txs_stats_read(struct seq_file *s
+ 	seq_puts(s, "\nlast_idx:");
+ 	for (i = 0; i < ARRAY_SIZE(st->last_idx); i++)
+ 		seq_printf(s, " %d:%u", i, st->last_idx[i]);
++
++	seq_puts(s, "\nslot_bw (acked, slot@MHz):");
++	for (i = 0; i < ARRAY_SIZE(st->slot_bw); i++)
++		for (j = 0; j < ARRAY_SIZE(st->slot_bw[i]); j++)
++			if (st->slot_bw[i][j])
++				seq_printf(s, " %d@%d %u", i, 20 << j,
++					   st->slot_bw[i][j]);
+ 	seq_puts(s, "\n");
+ 
+ 	return 0;
+@@ -736,6 +743,8 @@ int mt7615_init_debugfs(struct mt7615_de
+ 			    &fops_txs_stats_reset);
+ 	debugfs_create_devm_seqfile(dev->mt76.dev, "txs_fail_log", dir,
+ 				    mt7615_txs_fail_read);
++	debugfs_create_u32("bw160_change_bw_rate", 0600, dir,
++			   &dev->bw160_change_bw_rate);
+ 
+ 	if (is_mt7615(&dev->mt76)) {
+ 		debugfs_create_u32("dfs_hw_pattern", 0400, dir,
+--- a/mt7615/mac.c
++++ b/mt7615/mac.c
+@@ -1257,6 +1257,24 @@ u32 mt7615_mac_get_sta_tid_sn(struct mt7
+ 	return val & GENMASK(11, 0);
+ }
+ 
++/*
++ * Test override from debugfs for a set sent at 160 MHz: the slot after which
++ * the hardware sends at half the bandwidth (1-7), 0 for none.
++ */
++static u32 mt7615_mac_bw160_change_bw_rate(struct mt7615_dev *dev, u8 bw,
++					   u32 w5)
++{
++	u32 slot = READ_ONCE(dev->bw160_change_bw_rate);
++
++	if (bw != 3 || slot < 1 || slot > 7)
++		return w5;
++
++	w5 &= ~MT_WTBL_W5_CHANGE_BW_RATE;
++	w5 |= FIELD_PREP(MT_WTBL_W5_CHANGE_BW_RATE, slot);
++
++	return w5;
++}
++
+ void mt7615_mac_set_rates(struct mt7615_phy *phy, struct mt7615_sta *sta,
+ 			  struct ieee80211_tx_rate *probe_rate,
+ 			  struct ieee80211_tx_rate *rates)
+@@ -1294,6 +1312,7 @@ void mt7615_mac_set_rates(struct mt7615_
+ 	      FIELD_PREP(MT_WTBL_W5_CHANGE_BW_RATE,
+ 			 rd.bw_idx ? rd.bw_idx - 1 : 7) |
+ 	      rd.sgi;
++	w5 = mt7615_mac_bw160_change_bw_rate(dev, rd.bw, w5);
+ 
+ 	mt76_wr(dev, MT_WTBL_RIUCR0, w5);
+ 
+@@ -1496,6 +1515,9 @@ static void mt7615_txs_stats_flags(struc
+ 	st->total++;
+ 	st->tx_count[count]++;
+ 	st->last_idx[FIELD_GET(MT_TXS3_LAST_TX_RATE, txs3)]++;
++	if (!(txs0 & (MT_TXS0_ACK_ERROR_MASK | MT_TXS0_FIXED_RATE)))
++		st->slot_bw[FIELD_GET(MT_TXS3_LAST_TX_RATE, txs3)]
++			   [FIELD_GET(MT_TXS1_BW, txs1)]++;
+ 	if (!count)
+ 		st->no_tx++;
+ 	if (txs0 & MT_TXS0_FIXED_RATE)
+--- a/mt7615/mt7615.h
++++ b/mt7615/mt7615.h
+@@ -137,6 +137,8 @@ struct mt7615_txs_stats {
+ 	u32 bw[4][4];
+ 	u32 tx_count[32];
+ 	u32 last_idx[8];
++	/* acknowledged reports by last slot and bandwidth, for testing */
++	u32 slot_bw[8][4];
+ 
+ 	/* last tx status reports with a timeout, in txs_fail_log */
+ 	u32 fail_pos;
+@@ -315,6 +317,9 @@ struct mt7615_dev {
+ 
+ 	struct mt7615_txs_stats txs_stats;
+ 
++	/* test override of CHANGE_BW_RATE for rate sets sent at 160 MHz */
++	u32 bw160_change_bw_rate;
++
+ 	u32 debugfs_rf_wf;
+ 	u32 debugfs_rf_reg;
+ 
