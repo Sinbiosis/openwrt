@@ -9,6 +9,10 @@ MT7615, add:
   rate sets sent at 160 MHz, on MMIO only. 0, the default, leaves it as
   the driver sets it; a new value takes effect at the next rate set
   update.
+- bw160_force_tail in debugfs: when set, a set sent at 160 MHz gets the
+  robust rate as its third rate even if minstrel's most probable rate is
+  a 160 MHz one, so that with a pinned rate that fails, every frame
+  reaches slot 4.
 - a line in txs_stats that counts acknowledged tx status reports by
   their last slot and the bandwidth they report, so the bandwidth each
   slot was sent at shows directly.
@@ -29,18 +33,30 @@ MT7615, add:
  	seq_puts(s, "\n");
  
  	return 0;
-@@ -736,6 +743,8 @@ int mt7615_init_debugfs(struct mt7615_de
+@@ -736,6 +743,10 @@ int mt7615_init_debugfs(struct mt7615_de
  			    &fops_txs_stats_reset);
  	debugfs_create_devm_seqfile(dev->mt76.dev, "txs_fail_log", dir,
  				    mt7615_txs_fail_read);
 +	debugfs_create_u32("bw160_change_bw_rate", 0600, dir,
 +			   &dev->bw160_change_bw_rate);
++	debugfs_create_u32("bw160_force_tail", 0600, dir,
++			   &dev->bw160_force_tail);
  
  	if (is_mt7615(&dev->mt76)) {
  		debugfs_create_u32("dfs_hw_pattern", 0400, dir,
 --- a/mt7615/mac.c
 +++ b/mt7615/mac.c
-@@ -1257,6 +1257,24 @@ u32 mt7615_mac_get_sta_tid_sn(struct mt7
+@@ -1123,7 +1123,8 @@ mt7615_mac_update_rate_desc(struct mt761
+ 		};
+ 
+ 		ieee80211_rate_set_vht(&tail, 0, 1);
+-		if (!(rates[2].flags & IEEE80211_TX_RC_160_MHZ_WIDTH))
++		if (!(rates[2].flags & IEEE80211_TX_RC_160_MHZ_WIDTH) ||
++		    READ_ONCE(dev->bw160_force_tail))
+ 			rates[2] = tail;
+ 		rates[3] = tail;
+ 	}
+@@ -1257,6 +1258,24 @@ u32 mt7615_mac_get_sta_tid_sn(struct mt7
  	return val & GENMASK(11, 0);
  }
  
@@ -65,7 +81,7 @@ MT7615, add:
  void mt7615_mac_set_rates(struct mt7615_phy *phy, struct mt7615_sta *sta,
  			  struct ieee80211_tx_rate *probe_rate,
  			  struct ieee80211_tx_rate *rates)
-@@ -1294,6 +1312,7 @@ void mt7615_mac_set_rates(struct mt7615_
+@@ -1294,6 +1313,7 @@ void mt7615_mac_set_rates(struct mt7615_
  	      FIELD_PREP(MT_WTBL_W5_CHANGE_BW_RATE,
  			 rd.bw_idx ? rd.bw_idx - 1 : 7) |
  	      rd.sgi;
@@ -73,7 +89,7 @@ MT7615, add:
  
  	mt76_wr(dev, MT_WTBL_RIUCR0, w5);
  
-@@ -1496,6 +1515,9 @@ static void mt7615_txs_stats_flags(struc
+@@ -1496,6 +1516,9 @@ static void mt7615_txs_stats_flags(struc
  	st->total++;
  	st->tx_count[count]++;
  	st->last_idx[FIELD_GET(MT_TXS3_LAST_TX_RATE, txs3)]++;
@@ -94,12 +110,16 @@ MT7615, add:
  
  	/* last tx status reports with a timeout, in txs_fail_log */
  	u32 fail_pos;
-@@ -315,6 +317,9 @@ struct mt7615_dev {
+@@ -315,6 +317,13 @@ struct mt7615_dev {
  
  	struct mt7615_txs_stats txs_stats;
  
-+	/* test override of CHANGE_BW_RATE for rate sets sent at 160 MHz */
++	/*
++	 * test overrides for rate sets sent at 160 MHz: CHANGE_BW_RATE, and
++	 * the robust rate as the third rate even if minstrel's is 160 MHz
++	 */
 +	u32 bw160_change_bw_rate;
++	u32 bw160_force_tail;
 +
  	u32 debugfs_rf_wf;
  	u32 debugfs_rf_reg;
