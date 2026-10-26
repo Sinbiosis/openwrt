@@ -1,52 +1,41 @@
 wifi: mt76: mt7615: end rate sets sent at 160 MHz with a robust rate
 
-From the slot in CHANGE_BW_RATE on, the hardware sends a rate set at
-another bandwidth. After a set at 160 MHz, those tries went out as
-6 Mbit/s OFDM at 20 MHz and were practically never acknowledged in tests
-between two MT7615 at -65 to -69 dBm, with the primary channel at the
-lowest and at the second 20 MHz channel, although the peer received the
-6 Mbit/s beacons fine. With CHANGE_BW_RATE at slot 6, a frame that the
-first slots did not get through was lost.
+A frame gets two tries in each slot of its rate set and 12 in all, so
+one that starts in slot 0 ends in slot 5, with the third rate: minstrel's
+most probable one. A set with a 160 MHz rate is sent at the bandwidth of
+its probe or first rate, and its other rates are widened to it. That
+turns the most probable rate, often a 20 or 40 MHz rate at range, into
+one that needs up to 9 dB more signal (3 dB per doubling of the
+bandwidth, IEEE 802.11ac-2013 22.3.19.1; MCS 6 needs -65 dBm at 20 MHz
+and -56 dBm at 160 MHz). At range none of the 12 tries got through: in
+tests between two MT7615 at -64 to -69 dBm, 21 of 29 (AP) and 47 of 50
+(STA) frames sent with a set at 160 MHz were lost, and none of 376 sent
+with a narrower set.
 
-Those first slots are weak at range too: the set is widened to the
-bandwidth of its probe or first rate, which turns minstrel's most
-probable rate, often a 20 or 40 MHz rate at range, into one that needs up
-to 9 dB more signal (3 dB per doubling of the bandwidth, IEEE
-802.11ac-2013 22.3.19.1; MCS 6 needs -65 dBm at 20 MHz and -56 dBm at
-160 MHz). In those tests 21 of 29 (AP) and 47 of 50 (STA) frames sent
-with a set at 160 MHz were lost, and none of 376 sent with a narrower set.
-
-So for a set sent at 160 MHz, move CHANGE_BW_RATE to the last slot and
-end the set with the most robust rate at 160 MHz, one stream MCS 0
-(-73 dBm): always as the last rate, and as the third rate too if
-minstrel's most probable rate is narrower, as how that one does at
-160 MHz is unknown. Sets sent at other bandwidths do not change.
+End a set sent at 160 MHz with the most robust rate there, one stream
+MCS 0 (-73 dBm): as its last rate, which a frame reaches when the
+hardware starts it at a later slot (it keeps its place in the set
+between frames), and as its third rate too if minstrel's most probable
+rate is narrower, as how that rate does at 160 MHz is unknown. In the
+same tests nothing was lost afterwards: 0 of 368 frames, 77 of them
+sent with a set at 160 MHz.
 
 --- a/mt7615/mac.c
 +++ b/mt7615/mac.c
-@@ -1068,7 +1068,7 @@ mt7615_mac_update_rate_desc(struct mt761
- 	struct mt7615_dev *dev = phy->dev;
- 	struct mt76_phy *mphy = phy->mt76;
- 	struct ieee80211_tx_rate *ref;
--	bool rateset, stbc = false, same_bw = false;
-+	bool rateset, stbc = false, same_bw = false, robust_tail;
- 	int n_rates = sta->n_rates;
- 	u8 bw, bw_prev;
- 	u32 bw_flags;
 @@ -1107,6 +1107,27 @@ mt7615_mac_update_rate_desc(struct mt761
  		if (rates[i].flags & IEEE80211_TX_RC_160_MHZ_WIDTH)
  			same_bw = true;
  
 +	/*
-+	 * Tries from slot CHANGE_BW_RATE on go out at another bandwidth: from
-+	 * a set at 160 MHz as 6 Mbit/s OFDM at 20 MHz, which tests between two
-+	 * MT7615 never saw acknowledged. So a set sent at 160 MHz gets
-+	 * CHANGE_BW_RATE at the last slot instead and ends with the most
-+	 * robust rate there, one stream MCS 0. That also replaces the most
-+	 * probable rate if it is narrower, as its success at 160 MHz is unknown.
++	 * With two tries per slot and 12 in all, a frame ends with the third
++	 * rate, minstrel's most probable one, or with the last one if the
++	 * hardware starts it at a later slot. Widened to 160 MHz, the most
++	 * probable rate can need up to 9 dB more signal than where it was
++	 * measured, so end a set sent at 160 MHz with the most robust rate
++	 * there, one stream MCS 0: as the last rate, and as the third one
++	 * too if that one is narrower.
 +	 */
-+	robust_tail = bw_flags & IEEE80211_TX_RC_160_MHZ_WIDTH;
-+	if (robust_tail) {
++	if (bw_flags & IEEE80211_TX_RC_160_MHZ_WIDTH) {
 +		struct ieee80211_tx_rate tail = {
 +			.count = rates[3].count,
 +			.flags = IEEE80211_TX_RC_VHT_MCS | bw_flags,
@@ -60,15 +49,4 @@ minstrel's most probable rate is narrower, as how that one does at
 +
  	if (same_bw && probe_rate)
  		mt7615_mac_rate_set_bw(ref, bw_flags);
- 
-@@ -1175,6 +1196,10 @@ mt7615_mac_update_rate_desc(struct mt761
- 	if (bw_prev)
- 		rd->bw_idx = 7;
- 
-+	/* CHANGE_BW_RATE 7, see above */
-+	if (robust_tail)
-+		rd->bw_idx = 0;
-+
- 	rd->rateset = rateset;
- 	rd->bw = same_bw ? mt7615_mac_rate_bw(bw_flags) : bw;
  
